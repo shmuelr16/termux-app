@@ -88,6 +88,16 @@ public final class TerminalRenderer {
             final char[] line = lineObject.mText;
             final int charsUsedInLine = lineObject.getSpaceUsed();
 
+            // Rows containing right-to-left text are laid out with the Unicode bidirectional
+            // algorithm, so that Hebrew, Arabic and friends are displayed in the right order
+            // and the cursor stays at the right place. Everything else keeps using the fast
+            // left-to-right run based drawing below.
+            if (BidiLayout.containsRtl(line, charsUsedInLine) && !hasSixel(lineObject, charsUsedInLine)) {
+                renderBidiRow(canvas, palette, heightOffset, lineObject, line, charsUsedInLine, columns,
+                    cursorX, selx1, selx2, cursorShape, reverseVideo);
+                continue;
+            }
+
             long lastRunStyle = 0;
             boolean lastRunInsideCursor = false;
             boolean lastRunInsideSelection = false;
@@ -176,6 +186,79 @@ public final class TerminalRenderer {
             }
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
                 measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection);
+        }
+    }
+
+    /** True if the row contains a sixel image, which the bidirectional layout does not handle. */
+    private static boolean hasSixel(TerminalRow lineObject, int charsUsedInLine) {
+        for (int column = 0; column < lineObject.getSpaceUsed() && column < charsUsedInLine; column++) {
+            if (TextStyle.isTerminalBitmap(lineObject.getStyle(column)))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Draw a row that contains right-to-left text.
+     * <p/>
+     * Every cluster (a base character plus its combining marks) is drawn at the visual column
+     * given by the bidirectional algorithm, so text lines up with the terminal grid and the
+     * cursor can be drawn at the visual position of the logical cursor column.
+     */
+    private void renderBidiRow(Canvas canvas, int[] palette, float y, TerminalRow lineObject, char[] line,
+                               int charsUsedInLine, int columns, int cursorX, int selx1, int selx2,
+                               int cursorShape, boolean reverseVideo) {
+        BidiLayout layout = BidiLayout.create(line, charsUsedInLine, columns);
+        final char[] display = layout.displayChars();
+
+        // Selection background for parts of the row that hold no text.
+        if (selx1 >= 0 && selx2 > selx1) {
+            float left = layout.visualColumn(selx1) * mFontWidth;
+            float right = Math.min(columns, layout.visualColumn(Math.min(selx2, columns - 1)) + 1) * mFontWidth;
+            if (right > left) {
+                mTextPaint.setColor(palette[TextStyle.COLOR_INDEX_BACKGROUND]);
+                canvas.drawRect(left, y - mFontLineSpacingAndAscent + mFontAscent, right, y, mTextPaint);
+            }
+        }
+
+        boolean cursorDrawn = false;
+        int index = 0;
+        for (int column = 0; column < columns && index < charsUsedInLine; ) {
+            final int codePoint = Character.isHighSurrogate(line[index]) ? Character.toCodePoint(line[index], line[index + 1]) : line[index];
+            int charCount = Character.isHighSurrogate(line[index]) ? 2 : 1;
+            final long style = lineObject.getStyle(column);
+            int width = WcWidth.width(codePoint);
+            if (width < 1)
+                width = 1;
+            while (index + charCount < charsUsedInLine && WcWidth.width(line, index + charCount) <= 0)
+                charCount += Character.isHighSurrogate(line[index + charCount]) ? 2 : 1;
+
+            final int visualColumn = layout.visualColumn(column);
+            final boolean insideCursor = cursorX >= column && cursorX < column + width;
+            final boolean insideSelection = column + width - 1 >= selx1 && column <= selx2;
+            final int cursorColor = insideCursor ? palette[TextStyle.COLOR_INDEX_CURSOR] : 0;
+            final boolean invertCursorTextColor = insideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
+            cursorDrawn |= insideCursor;
+
+            drawTextRun(canvas, display, palette, y, visualColumn, width, index, charCount,
+                mTextPaint.measureText(display, index, charCount), cursorColor, cursorShape, style,
+                reverseVideo || invertCursorTextColor || insideSelection);
+
+            column += width;
+            index += charCount;
+        }
+
+        // The cursor may sit on an empty cell (or past the end of the text) of a bidi row.
+        if (cursorX >= 0 && !cursorDrawn) {
+            float left = layout.visualColumn(cursorX) * mFontWidth;
+            float top = y - mFontLineSpacingAndAscent + mFontAscent;
+            float bottom = y;
+            if (cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_UNDERLINE)
+                top = bottom - (mFontLineSpacingAndAscent - mFontAscent) / 4.f;
+            else if (cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BAR)
+                left += (mFontWidth * 3) / 4.f;
+            mTextPaint.setColor(palette[TextStyle.COLOR_INDEX_CURSOR]);
+            canvas.drawRect(left, top, left + mFontWidth, bottom, mTextPaint);
         }
     }
 
